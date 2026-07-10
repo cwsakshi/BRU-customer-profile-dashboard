@@ -420,6 +420,99 @@ with col_e:
 st.divider()
 
 
+# ── 5. Finishing Dashboard ───────────────────────────────────────────────────
+
+st.markdown('<p class="sec-title">✨ Special Finish Analysis</p>', unsafe_allow_html=True)
+fin_c1, fin_c2 = st.columns([5,1])
+with fin_c1:
+    st.markdown('<p class="sec-sub">Which finishes BRU orders most, how they vary by collection, and trend over time</p>', unsafe_allow_html=True)
+with fin_c2:
+    fin_order = st.selectbox("", ["All","Repeat Order","New Order"], key="fin_ot")
+dff_fin = dff if fin_order=="All" else dff[dff["PO_Type"]==("REPEAT ORDER" if fin_order=="Repeat Order" else "NEW ORDER")]
+
+col_f1, col_f2 = st.columns(2, gap="large")
+
+with col_f1:
+    st.caption("Finish mix — qty ordered (m)")
+    fin_vol = (dff_fin.groupby("Finish")["Qty_m"].sum()
+                      .reset_index().sort_values("Qty_m", ascending=True))
+    fig_fv = go.Figure(go.Bar(
+        x=fin_vol["Qty_m"], y=fin_vol["Finish"],
+        orientation="h",
+        marker=dict(
+            color=list(range(len(fin_vol))),
+            colorscale=[[0,"#1a3a5c"],[0.4,"#4C9EFF"],[1,"#93C5FD"]],
+            showscale=False, opacity=0.9,
+        ),
+        text=fin_vol["Qty_m"].apply(lambda v: f"  {v:,.0f}m"),
+        textposition="outside", textfont=dict(color="#D1D5DB", size=10),
+        hovertemplate="<b>%{y}</b><br>%{x:,.0f} m<extra></extra>",
+    ))
+    fig_fv.update_layout(
+        height=300, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=5,b=25,l=220,r=90), font=dict(color="#E5E7EB"),
+        xaxis=dict(showgrid=False, tickfont=dict(size=10, color="#9CA3AF")),
+        yaxis=dict(showgrid=False, tickfont=dict(size=10, color="#D1D5DB")),
+    )
+    st.plotly_chart(fig_fv, use_container_width=True)
+
+with col_f2:
+    st.caption("Finish by collection — top 8 collections")
+    top8c = dff_fin.groupby("Collection")["Qty_m"].sum().nlargest(8).index.tolist()
+    fc = (dff_fin[dff_fin["Collection"].isin(top8c)]
+              .groupby(["Collection","Finish"])["Qty_m"].sum().reset_index())
+    fc_pivot = fc.pivot(index="Collection", columns="Finish", values="Qty_m").fillna(0)
+    fc_pivot = fc_pivot.reindex(
+        dff_fin[dff_fin["Collection"].isin(top8c)]
+               .groupby("Collection")["Qty_m"].sum().sort_values().index
+    ).reset_index()
+    fig_fc = go.Figure()
+    fin_types = [c for c in fc_pivot.columns if c != "Collection"]
+    fin_colors = ["#4C9EFF","#34D399","#FBBF24","#A78BFA","#F87171","#22D3EE","#FB923C","#E879F9"]
+    for i, fin in enumerate(fin_types):
+        fig_fc.add_trace(go.Bar(
+            x=fc_pivot[fin], y=fc_pivot["Collection"],
+            name=fin, orientation="h",
+            marker=dict(color=fin_colors[i % len(fin_colors)], opacity=0.85),
+            hovertemplate=f"<b>%{{y}}</b><br>{fin}: %{{x:,.0f}} m<extra></extra>",
+        ))
+    fig_fc.update_layout(
+        barmode="stack", height=300,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(t=5,b=25,l=100,r=15), font=dict(color="#E5E7EB"),
+        xaxis=dict(showgrid=False, tickfont=dict(size=9, color="#9CA3AF")),
+        yaxis=dict(showgrid=False, tickfont=dict(size=9, color="#D1D5DB")),
+        legend=dict(orientation="v", x=1.01, y=1, font=dict(size=8, color="#D1D5DB"),
+                    bgcolor="rgba(0,0,0,0)"),
+    )
+    st.plotly_chart(fig_fc, use_container_width=True)
+
+# Finish trend over time
+st.caption("Finish trend — qty ordered per year by finish type")
+fin_yr = (dff_fin.groupby(["Year","Finish"])["Qty_m"].sum().reset_index())
+fig_ft = go.Figure()
+for i, fin in enumerate(dff_fin["Finish"].dropna().unique()):
+    sub = fin_yr[fin_yr["Finish"]==fin].sort_values("Year")
+    if len(sub) == 0: continue
+    fig_ft.add_trace(go.Bar(
+        x=sub["Year"].astype(str), y=sub["Qty_m"],
+        name=fin, marker=dict(color=fin_colors[i % len(fin_colors)], opacity=0.85),
+        hovertemplate=f"<b>{fin}</b><br>%{{x}}: %{{y:,.0f}} m<extra></extra>",
+    ))
+fig_ft.update_layout(
+    barmode="group", height=280,
+    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    margin=dict(t=5,b=30,l=55,r=15), font=dict(color="#E5E7EB"),
+    xaxis=dict(showgrid=False, tickfont=dict(size=11, color="#9CA3AF")),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.07)", tickfont=dict(size=11, color="#9CA3AF")),
+    legend=dict(orientation="h", y=1.12, x=0, font=dict(size=9, color="#D1D5DB"),
+                bgcolor="rgba(0,0,0,0)"),
+)
+st.plotly_chart(fig_ft, use_container_width=True)
+
+st.divider()
+
+
 # ── Report generator ──────────────────────────────────────────────────────────
 
 # ── build_report ──────────────────────────────────────────────────────────────
@@ -499,13 +592,14 @@ def build_yoy_report(df_in):
     grp=(neo.groupby(["Launch Year","Broad Category","Collection"],dropna=False)
             .agg(HF_Quality=("Quality",lambda x:" / ".join(x.dropna().unique()[:2])),
                  Design=("Design",lambda x:" / ".join(x.dropna().astype(str).unique()[:2])),
+                 Finish=("Finish",lambda x:" / ".join(x.dropna().unique()[:2])),
                  Launch_Mon=("Launch Mon-Yr",lambda x:x.dropna().iloc[0] if len(x.dropna()) else ""),
                  Order_Date=("Date","min"),SKUs=("SKU_line","count"))
             .reset_index().sort_values(["Launch Year","Launch_Mon","Order_Date"]))
     grp["Order Dt"]=grp["Order_Date"].apply(lambda d:d.strftime("%d-%m-%Y") if pd.notna(d) else "")
     grp["Order recd"]="Yes"
-    COLS=["#","Broad Category","Collection Name","HF Quality","Design","Launch Year","SKUs","Order Dt","Order recd"]
-    WIDTHS=[5,18,22,22,18,14,8,16,12]
+    COLS=["#","Broad Category","Collection Name","HF Quality","Design","Special Finish","Launch Year","SKUs","Order Dt","Order recd"]
+    WIDTHS=[5,18,22,22,18,24,14,8,16,12]
     wb=Workbook(); ws=wb.active; ws.title="Year on Year Launches"
     ncols=len(COLS); cl=get_column_letter(ncols)
     for i,w in enumerate(WIDTHS,1): ws.column_dimensions[get_column_letter(i)].width=w
@@ -544,7 +638,7 @@ def build_yoy_report(df_in):
         for idx,(_,row) in enumerate(yr_data.iterrows(),1):
             current_row+=1; bg=ALT_BG if idx%2==0 else "FFFFFF"; fill=PatternFill("solid",fgColor=bg)
             vals=[idx,row["Broad Category"],row["Collection"],row["HF_Quality"],row["Design"],
-                  row["Launch_Mon"],int(row["SKUs"]),row["Order Dt"],row["Order recd"]]
+                  row.get("Finish",""),row["Launch_Mon"],int(row["SKUs"]),row["Order Dt"],row["Order recd"]]
             total_skus+=int(row["SKUs"])
             for ci,val in enumerate(vals,1):
                 c=ws.cell(row=current_row,column=ci,value=val)
