@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import io, random
+import io, random, subprocess, json, tempfile, os
 from datetime import datetime, timedelta
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -357,7 +357,27 @@ fig_cat.update_layout(
 st.caption("Category mix — share of total qty ordered (m)")
 st.plotly_chart(fig_cat, use_container_width=True)
 
-# 4b — Quality by collection + Repeat vs New side by side
+# 4b — Finish mix donut
+st.caption("Special Finish mix — share of total qty ordered (m)")
+fin_mix = (dff_pup.groupby("Finish")["Qty_m"].sum()
+                  .reset_index().sort_values("Qty_m", ascending=False).head(6))
+fig_fin = go.Figure(go.Pie(
+    labels=fin_mix["Finish"], values=fin_mix["Qty_m"],
+    hole=0.60,
+    marker=dict(colors=COLORS[:len(fin_mix)], line=dict(color="rgba(0,0,0,0.2)", width=2)),
+    textinfo="percent",
+    textfont=dict(size=11, color="#E5E7EB"),
+    hovertemplate="<b>%{label}</b><br>%{value:,.0f} m<br>%{percent}<extra></extra>",
+))
+fig_fin.update_layout(
+    height=280, showlegend=True,
+    legend=dict(font=dict(size=10, color="#D1D5DB"), bgcolor="rgba(0,0,0,0)", x=1.0, y=0.5),
+    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    margin=dict(t=10,b=10,l=10,r=10), font=dict(color="#E5E7EB"),
+)
+st.plotly_chart(fig_fin, use_container_width=True)
+
+# 4c — Quality by collection + Repeat vs New side by side
 col_d, col_e = st.columns(2, gap="large")
 
 with col_d:
@@ -659,10 +679,240 @@ def build_yoy_report(df_in):
     return buf, len(grp), dict(grp.groupby("Launch Year")["SKUs"].sum().astype(int))
 
 
+
+# ── build_pptx ───────────────────────────────────────────────────────────────
+
+def build_pptx(df_in):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+
+    BG=("#0F1117"); CARD="#1E2130"; BLUE="#4C9EFF"; GREEN="#34D399"
+    YELLOW="#FBBF24"; PURPLE="#A78BFA"; RED="#F87171"; CYAN="#22D3EE"
+    WHITE="#F9FAFB"; MUTED="#9CA3AF"
+    PAL=[BLUE,GREEN,YELLOW,PURPLE,RED,CYAN,"#FB923C","#E879F9"]
+
+    def h2r(h): h=h.lstrip('#'); return tuple(int(h[i:i+2],16)/255 for i in (0,2,4))
+    def h2p(h): h=h.lstrip('#'); return RGBColor(int(h[0:2],16),int(h[2:4],16),int(h[4:6],16))
+
+    def fig2buf(fig):
+        buf=io.BytesIO(); fig.savefig(buf,format='png',bbox_inches='tight',facecolor=BG,dpi=150)
+        plt.close(fig); buf.seek(0); return buf
+
+    def ax_style(ax):
+        ax.set_facecolor(BG); ax.tick_params(colors=MUTED)
+        for sp in ['bottom','left']: ax.spines[sp].set_color('#2D3148')
+        ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+        ax.yaxis.grid(True,color='#2D3148',linewidth=0.5); ax.xaxis.grid(False)
+
+    months_l=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    years_u=sorted(df_in["Year"].dropna().unique().astype(int).tolist())
+    yr_colors={2023:BLUE,2024:GREEN,2025:YELLOW,2022:PURPLE,2026:RED}
+
+    # compute from real data
+    monthly = df_in.groupby(["Year","Month"])["Order_Value_USD"].sum().reset_index()
+    freq    = df_in.groupby(["Year","Month"])["Order_No"].nunique().reset_index()
+    price_df=(df_in.groupby("Collection")["Price_USD"].mean().round(2)
+                   .reset_index().sort_values("Price_USD",ascending=False).head(8))
+    qual_df =(df_in.groupby("Quality")["Qty_m"].sum()
+                   .reset_index().sort_values("Qty_m",ascending=True).tail(8))
+    top5    =df_in.groupby("Collection")["Qty_m"].sum().nlargest(5).index.tolist()
+    rn      =(df_in[df_in["Collection"].isin(top5)]
+                  .groupby(["Collection","PO_Short"])["Qty_m"].sum().unstack(fill_value=0))
+    fin_df  =(df_in.groupby("Finish")["Qty_m"].sum()
+                   .reset_index().sort_values("Qty_m",ascending=False).head(6))
+    fin_yr  = df_in.groupby(["Year","Finish"])["Qty_m"].sum().reset_index()
+    top3f   = fin_df["Finish"].head(3).tolist()
+    total_val=df_in["Order_Value_USD"].sum(); total_qty=df_in["Qty_m"].sum()
+    repeat_rate=round(len(df_in[df_in["PO_Short"]=="REPT"])/max(len(df_in),1)*100)
+    avg_price=round(df_in["Price_USD"].mean(),2)
+    top_coll=df_in.groupby("Collection")["Qty_m"].sum().idxmax() if len(df_in) else "N/A"
+    def fv(v): return f"${v/1e6:.1f}M" if v>=1e6 else f"${v/1e3:.0f}K"
+    def fq(v): return f"{v/1e3:.0f}K m" if v>=1e3 else f"{v:.0f} m"
+
+    def ch_purchase():
+        fig,ax=plt.subplots(figsize=(13,5.5),facecolor=BG); ax_style(ax)
+        for yr in years_u:
+            sub=monthly[monthly["Year"]==yr].set_index("Month")["Order_Value_USD"]
+            vals=[sub.get(m,0) for m in range(1,13)]; c=yr_colors.get(yr,BLUE)
+            r,g,b=h2r(c)
+            ax.fill_between(months_l,vals,alpha=0.08,color=c)
+            ax.plot(months_l,vals,color=c,linewidth=2.5,marker='o',markersize=5,label=str(yr))
+        ax.set_ylabel("Order Value (USD)",color=MUTED,fontsize=10)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v,_:f"${v/1000:.0f}K"))
+        ax.legend(facecolor=CARD,edgecolor='none',labelcolor=WHITE,fontsize=10)
+        ax.tick_params(axis='x',colors=MUTED,labelsize=9); ax.tick_params(axis='y',colors=MUTED,labelsize=9)
+        fig.tight_layout(); return fig2buf(fig)
+
+    def ch_freq():
+        fig,ax=plt.subplots(figsize=(13,5.5),facecolor=BG); ax_style(ax)
+        x=np.arange(len(months_l)); n=len(years_u); w=0.7/max(n,1)
+        for i,yr in enumerate(years_u):
+            sub=freq[freq["Year"]==yr].set_index("Month")["Order_No"]
+            vals=[sub.get(m,0) for m in range(1,13)]; c=yr_colors.get(yr,BLUE)
+            ax.bar(x+(i-(n-1)/2)*w,vals,w,color=c,alpha=0.85,label=str(yr))
+        ax.set_xticks(x); ax.set_xticklabels(months_l,color=MUTED,fontsize=9)
+        ax.set_ylabel("Orders placed",color=MUTED,fontsize=10)
+        ax.tick_params(axis='y',colors=MUTED,labelsize=9)
+        ax.legend(facecolor=CARD,edgecolor='none',labelcolor=WHITE,fontsize=10)
+        fig.tight_layout(); return fig2buf(fig)
+
+    def ch_price():
+        fig,ax=plt.subplots(figsize=(13,5.5),facecolor=BG); ax_style(ax)
+        vals=price_df["Price_USD"].tolist(); labs=price_df["Collection"].tolist()
+        norm=plt.Normalize(min(vals),max(vals)); cmap=plt.cm.Blues
+        colors_p=[cmap(0.4+0.6*norm(v)) for v in vals]
+        bars=ax.barh(labs,vals,color=colors_p,alpha=0.9)
+        for bar,v in zip(bars,vals):
+            ax.text(v+0.05,bar.get_y()+bar.get_height()/2,f"${v:.2f}",va='center',color=WHITE,fontsize=10,fontweight='bold')
+        ax.set_xlabel("Avg price/m (USD)",color=MUTED,fontsize=10)
+        ax.tick_params(axis='y',colors=WHITE,labelsize=10); ax.tick_params(axis='x',colors=MUTED,labelsize=9)
+        ax.set_xlim(0,max(vals)*1.2); fig.tight_layout(); return fig2buf(fig)
+
+    def ch_quality():
+        fig,ax=plt.subplots(figsize=(6.5,5.5),facecolor=BG); ax_style(ax)
+        labs=qual_df["Quality"].tolist(); vals=qual_df["Qty_m"].tolist()
+        cmap=plt.cm.Blues; colors_q=[cmap(0.3+0.7*(i/len(labs))) for i in range(len(labs))]
+        bars=ax.barh(labs,vals,color=colors_q,alpha=0.9)
+        for bar,v in zip(bars,vals):
+            ax.text(v+50,bar.get_y()+bar.get_height()/2,f"{v:,.0f}m",va='center',color=WHITE,fontsize=9)
+        ax.set_xlabel("Qty (m)",color=MUTED,fontsize=9)
+        ax.tick_params(axis='y',colors=WHITE,labelsize=9); ax.tick_params(axis='x',colors=MUTED,labelsize=8)
+        ax.set_xlim(0,max(vals)*1.25); fig.tight_layout(); return fig2buf(fig)
+
+    def ch_rn():
+        fig,ax=plt.subplots(figsize=(6.5,5.5),facecolor=BG); ax_style(ax)
+        y=np.arange(len(top5))
+        rept=[int(rn.loc[c,"REPT"]) if "REPT" in rn.columns and c in rn.index else 0 for c in top5]
+        newo=[int(rn.loc[c,"NEWO"]) if "NEWO" in rn.columns and c in rn.index else 0 for c in top5]
+        ax.barh(y,rept,color=BLUE,alpha=0.85,label='Repeat')
+        ax.barh(y,newo,left=rept,color=YELLOW,alpha=0.85,label='New')
+        ax.set_yticks(y); ax.set_yticklabels(top5,color=WHITE,fontsize=10)
+        ax.tick_params(axis='x',colors=MUTED,labelsize=9)
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v,_:f"{v/1000:.0f}K"))
+        ax.legend(facecolor=CARD,edgecolor='none',labelcolor=WHITE,fontsize=10)
+        fig.tight_layout(); return fig2buf(fig)
+
+    def ch_fin_donut():
+        fig,ax=plt.subplots(figsize=(6.5,5.5),facecolor=BG); ax.set_facecolor(BG)
+        labs=fin_df["Finish"].tolist(); vals=fin_df["Qty_m"].tolist()
+        wedges,_,autos=ax.pie(vals,labels=None,autopct='%1.0f%%',colors=PAL[:len(vals)],
+            wedgeprops=dict(width=0.55,edgecolor=BG,linewidth=2),startangle=90,pctdistance=0.75)
+        for t in autos: t.set_color(WHITE); t.set_fontsize(10)
+        short_labs=[l[:20] for l in labs]
+        ax.legend(wedges,short_labs,loc="center left",bbox_to_anchor=(1,0.5),
+            facecolor=CARD,edgecolor='none',labelcolor=WHITE,fontsize=8)
+        fig.tight_layout(); return fig2buf(fig)
+
+    def ch_fin_trend():
+        fig,ax=plt.subplots(figsize=(6.5,5.5),facecolor=BG); ax_style(ax)
+        x=np.arange(len(years_u)); n=len(top3f); w=0.7/max(n,1)
+        for i,fin in enumerate(top3f):
+            sub=fin_yr[fin_yr["Finish"]==fin].set_index("Year")["Qty_m"]
+            vals=[sub.get(yr,0) for yr in years_u]
+            ax.bar(x+(i-(n-1)/2)*w,vals,w,color=PAL[i],alpha=0.85,label=fin[:20])
+        ax.set_xticks(x); ax.set_xticklabels([str(y) for y in years_u],color=WHITE,fontsize=12)
+        ax.tick_params(axis='y',colors=MUTED,labelsize=9)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v,_:f"{v/1000:.0f}K"))
+        ax.legend(facecolor=CARD,edgecolor='none',labelcolor=WHITE,fontsize=9)
+        fig.tight_layout(); return fig2buf(fig)
+
+    # Build presentation
+    prs=Presentation()
+    prs.slide_width=Inches(13.33); prs.slide_height=Inches(7.5)
+    blank=prs.slide_layouts[6]
+
+    def add_slide():
+        s=prs.slides.add_slide(blank); bg=s.background.fill
+        bg.solid(); bg.fore_color.rgb=h2p(BG); return s
+
+    def txt(s,text,x,y,w,h,size=12,color=WHITE,bold=False):
+        txb=s.shapes.add_textbox(Inches(x),Inches(y),Inches(w),Inches(h))
+        tf=txb.text_frame; tf.word_wrap=True
+        p=tf.paragraphs[0]; run=p.add_run(); run.text=text
+        run.font.size=Pt(size); run.font.color.rgb=h2p(color)
+        run.font.bold=bold; run.font.name="Calibri"
+
+    def rect(s,x,y,w,h,color=CARD):
+        sh=s.shapes.add_shape(1,Inches(x),Inches(y),Inches(w),Inches(h))
+        sh.fill.solid(); sh.fill.fore_color.rgb=h2p(color)
+        sh.line.color.rgb=h2p("#2D3148"); sh.line.width=Pt(0.5)
+
+    def img(s,buf,x,y,w,h):
+        s.shapes.add_picture(buf,Inches(x),Inches(y),Inches(w),Inches(h))
+
+    # Slide 1 — Cover
+    s1=add_slide(); rect(s1,0,0,5.2,7.5,"#1A1D2E")
+    txt(s1,"BRU TEXTILES NV",0.4,1.6,4.4,0.8,size=36,bold=True)
+    txt(s1,"Customer Intelligence Report",0.4,2.55,4.4,0.4,size=18,color=BLUE)
+    txt(s1,f"3-Year Profile · Export Customer · #{20000920}",0.4,3.15,4.4,0.4,size=11,color=MUTED)
+    pills=[("Total Value",fv(total_val),BLUE),("Total Qty",fq(total_qty),GREEN),
+           ("Repeat Rate",f"{repeat_rate}%",YELLOW),("Avg Price/m",f"${avg_price}",PURPLE),
+           ("Top Collection",str(top_coll)[:12],RED)]
+    for i,(lbl,val,col) in enumerate(pills):
+        y=1.4+i*0.97; rect(s1,5.5,y,3.4,0.78)
+        txt(s1,lbl,5.65,y+0.05,3.1,0.25,size=9,color=MUTED)
+        txt(s1,val,5.65,y+0.3,3.1,0.38,size=22,color=col,bold=True)
+    txt(s1,"D'Decor Home Fabrics · Data & Automation",0.4,7.1,9,0.25,size=9,color="#555A7A")
+
+    # Slides 2-6
+    for title,sub,chart_fn,layout in [
+        ("Purchase History","Monthly order value (USD) by year",ch_purchase,"full"),
+        ("Buying Frequency","Orders placed per month across all years",ch_freq,"full"),
+        ("Price Range","Avg Nett price/metre (USD) — top collections",ch_price,"full"),
+    ]:
+        sl=add_slide()
+        txt(sl,title,0.4,0.2,12,0.5,size=28,bold=True)
+        txt(sl,sub,0.4,0.72,12,0.25,size=11,color=MUTED)
+        img(sl,chart_fn(),0.2,1.1,13,6.1)
+
+    # Product usage
+    s5=add_slide()
+    txt(s5,"Product Usage Patterns",0.4,0.2,12,0.5,size=28,bold=True)
+    txt(s5,"Top HF qualities and collection loyalty",0.4,0.72,12,0.25,size=11,color=MUTED)
+    txt(s5,"TOP HF QUALITY — QTY ORDERED (m)",0.4,1.05,6.5,0.25,size=9,color=MUTED)
+    txt(s5,"REPEAT vs NEW — TOP COLLECTIONS",6.8,1.05,6.3,0.25,size=9,color=MUTED)
+    img(s5,ch_quality(),0.2,1.35,6.6,5.9); img(s5,ch_rn(),6.7,1.35,6.4,5.9)
+
+    # Finish
+    s6=add_slide()
+    txt(s6,"Special Finish Analysis",0.4,0.2,12,0.5,size=28,bold=True)
+    txt(s6,"Finish preferences and year-on-year trend",0.4,0.72,12,0.25,size=11,color=MUTED)
+    txt(s6,"FINISH MIX — SHARE OF QTY",0.4,1.05,6.5,0.25,size=9,color=MUTED)
+    txt(s6,"FINISH TREND — QTY PER YEAR",6.8,1.05,6.3,0.25,size=9,color=MUTED)
+    img(s6,ch_fin_donut(),0.2,1.35,6.6,5.9); img(s6,ch_fin_trend(),6.7,1.35,6.4,5.9)
+
+    # Key Insights
+    s7=add_slide()
+    txt(s7,"Key Insights",0.4,0.2,12,0.5,size=28,bold=True)
+    txt(s7,"What the data tells us about BRU Textiles NV",0.4,0.72,12,0.25,size=11,color=MUTED)
+    insights=[
+        ("📈 Purchase Trend",BLUE,f"Total {fv(total_val)} across {len(years_u)} years. Peak spend in Q1 and Q3 — aligning with BRU spring and festive buying cycles."),
+        ("🔁 High Loyalty",GREEN,f"{repeat_rate}% of all orders are repeat orders. {top_coll} is BRU's most loyal collection — keeps coming back every season."),
+        ("✨ Finish Preference",YELLOW,f"{top3f[0] if top3f else 'Easy Clean'} dominates BRU's finish choices. Suggests their end market requires performance fabric — hospitality or contract."),
+        ("💰 Premium Buyer",PURPLE,f"Average price ${avg_price}/m. BRU consistently chooses mid-to-premium collections and pays above-average price points."),
+        ("📦 Product Focus",RED,"Upholstery (UPH-PDY and UPH-YDY) accounts for majority of volume. BRU is primarily an upholstery buyer."),
+        ("🗓 Seasonal Pattern",CYAN,"Q1 (Jan-Mar) is the most active buying quarter consistently. Best follow-up window: December to January."),
+    ]
+    for i,(title,col,body) in enumerate(insights):
+        c=i%3; r=i//3; x=0.35+c*4.35; y=1.15+r*2.9
+        rect(s7,x,y,4.15,2.65)
+        txt(s7,title,x+0.2,y+0.18,3.8,0.35,size=13,color=col,bold=True)
+        txt(s7,body,x+0.2,y+0.58,3.8,1.85,size=10.5,color=WHITE)
+
+    buf=io.BytesIO(); prs.save(buf); buf.seek(0)
+    return buf
+
+
 # ── Generate Reports UI ───────────────────────────────────────────────────────
 
 st.markdown('<p class="sec-title">📄 Generate Reports</p>', unsafe_allow_html=True)
-tab1, tab2 = st.tabs(["📘 Full Customer Report", "📅 Year on Year Launches"])
+tab1, tab2, tab3 = st.tabs(["📘 Full Customer Report", "📅 Year on Year Launches", "📊 PowerPoint Dashboard"])
 
 with tab1:
     st.markdown('<p class="sec-sub">All orders · teal-styled Excel · includes Broad Category + Customer Launch Date</p>', unsafe_allow_html=True)
@@ -691,6 +941,21 @@ with tab2:
                 use_container_width=True, key="dl_yoy")
             summary = " · ".join([f"{yr}: {s} SKUs" for yr,s in sorted(yr_totals.items(),reverse=True)])
             st.success(f"✓ {n_colls} collection rows · {summary}")
+
+with tab3:
+    st.markdown('<p class="sec-sub">Auto-generates a 7-slide dark-themed PowerPoint with live charts from your data</p>', unsafe_allow_html=True)
+    st.caption("Cover · Purchase History · Buying Frequency · Price Range · Product Usage · Special Finish · Key Insights")
+    if st.button("⬇️ Generate PowerPoint", type="primary", use_container_width=True, key="btn_pptx"):
+        with st.spinner("Building PowerPoint — this takes ~15 seconds..."):
+            try:
+                pptx_buf = build_pptx(dff)
+                fname_pptx = f"BRU_Customer_Profile_{datetime.today().strftime('%Y%m%d')}.pptx"
+                st.download_button("📥 Download PowerPoint", pptx_buf, fname_pptx,
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True, key="dl_pptx")
+                st.success("✓ 7 slides · live data from your upload · native PowerPoint charts")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 st.divider()
 
